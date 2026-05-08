@@ -104,6 +104,16 @@ export default function Dashboard({ onAssetSelect }: DashboardProps) {
 
   return (
     <div className="space-y-4">
+      <Card className="border-yellow-500/40 bg-yellow-500/5">
+        <CardContent className="p-4 flex items-start gap-2 text-sm">
+          <AlertTriangle className="h-4 w-4 mt-0.5 text-yellow-500" />
+          <div>
+            <p className="font-semibold">PULSE is in Beta</p>
+            <p className="text-muted-foreground">Use insights for decision support. Validate entries with your own risk process.</p>
+          </div>
+        </CardContent>
+      </Card>
+
       {/* Key Metrics */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
         {/* Market Sentiment */}

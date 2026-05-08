@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { ArrowLeft, TrendingUp, TrendingDown, Activity, Target } from 'lucide-react';
+import { ArrowLeft, TrendingUp, TrendingDown, Activity, Target, ShieldAlert } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -46,7 +46,7 @@ export default function AssetDetail({ asset, onBack }: AssetDetailProps) {
           getChartData(asset.symbol, timeframe, 30),
           getTechnicals(asset.symbol, timeframe),
           getAssetNews(asset.symbol, 10),
-          getSignal(asset.symbol),
+          getSignal(asset.symbol, "strict"),
           getFlowData(asset.symbol),
         ]);
 
@@ -133,6 +133,20 @@ export default function AssetDetail({ asset, onBack }: AssetDetailProps) {
         </div>
       </div>
 
+      <Card className="border-yellow-500/40 bg-yellow-500/5">
+        <CardContent className="p-4 text-sm">
+          <div className="flex items-start gap-2">
+            <ShieldAlert className="h-4 w-4 mt-0.5 text-yellow-500" />
+            <div>
+              <p className="font-semibold">PULSE Beta Intelligence Mode</p>
+              <p className="text-muted-foreground">
+                Signals are provided for research support. Data quality is enforced in <span className="font-medium">STRICT</span> mode on this screen.
+              </p>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
       {/* Price Header */}
       <div className="flex items-end justify-between">
         <div>
@@ -207,6 +221,24 @@ export default function AssetDetail({ asset, onBack }: AssetDetailProps) {
               <p className="text-sm font-medium">Thesis</p>
               <p className="text-sm text-muted-foreground">{signal.thesis}</p>
             </div>
+
+            {(signal as any).data_quality && (
+              <div className="mt-4">
+                <p className="text-sm font-medium">Data Quality</p>
+                <div className="flex flex-wrap gap-2 mt-1">
+                  <Badge variant="outline">Mode: {(signal as any).data_quality.mode?.toUpperCase()}</Badge>
+                  <Badge variant="outline">OHLCV: {(signal as any).data_quality.ohlcv_points}</Badge>
+                  <Badge variant="outline">News: {(signal as any).data_quality.news_items}</Badge>
+                  <Badge variant="outline">Freshness: {(signal as any).data_quality.freshness_score}</Badge>
+                  <Badge variant="outline">Agents: {(signal as any).data_quality.agent_count ?? 'n/a'}</Badge>
+                </div>
+                {((signal as any).data_quality.warnings || []).length > 0 && (
+                  <p className="text-xs text-yellow-500 mt-2">
+                    Warnings: {((signal as any).data_quality.warnings || []).join(', ')}
+                  </p>
+                )}
+              </div>
+            )}
 
             {signal.supporting_evidence.length > 0 && (
               <div className="mt-4">

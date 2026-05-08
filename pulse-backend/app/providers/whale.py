@@ -1,10 +1,12 @@
 """Whale Transaction Monitor - Real free-source on-chain aggregation"""
 import httpx
+import time
 from typing import List, Dict, Optional
 from datetime import datetime, timedelta
 import logging
 
 from ..core.config import settings
+from ..services.observability import observability
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +34,7 @@ class WhaleMonitorProvider:
         self._cache = {}
         self._cache_time = {}
         self._cache_duration = 20
+        self._schema_version = "1.1"
 
     def _get_cached(self, key: str):
         if key in self._cache and datetime.now() - self._cache_time[key] < timedelta(seconds=self._cache_duration):
@@ -41,6 +44,39 @@ class WhaleMonitorProvider:
     def _set_cache(self, key: str, value):
         self._cache[key] = value
         self._cache_time[key] = datetime.now()
+
+    def _normalize_event(
+        self,
+        chain: str,
+        symbol: str,
+        tx_id: str,
+        amount: float,
+        amount_usd: float,
+        from_address: str,
+        to_address: str,
+        timestamp: datetime,
+        source: str,
+        confidence: float
+    ) -> Dict:
+        confidence = max(0.0, min(1.0, confidence))
+        return {
+            "id": tx_id,
+            "symbol": symbol.upper(),
+            "amount": amount,
+            "amount_usd": amount_usd,
+            "from_address": from_address,
+            "to_address": to_address,
+            "from_exchange": self.identify_exchange(from_address),
+            "to_exchange": self.identify_exchange(to_address),
+            "transaction_type": self.classify_transaction(from_address, to_address),
+            "timestamp": timestamp,
+            "blockchain": chain,
+            "source": source,
+            "schema": "normalized_whale_event",
+            "schema_version": self._schema_version,
+            "confidence_score": round(confidence, 3),
+            "chain_confidence": {"chain": chain, "confidence": round(confidence, 3)}
+        }
 
     async def _get_btc_price(self) -> float:
         try:
@@ -71,6 +107,7 @@ class WhaleMonitorProvider:
             return txs
 
         try:
+            t0 = time.perf_counter()
             async with httpx.AsyncClient() as client:
                 response = await client.get(
                     "https://blockchain.info/unconfirmed-transactions?format=json",
@@ -78,6 +115,7 @@ class WhaleMonitorProvider:
                 )
                 response.raise_for_status()
                 data = response.json()
+                observability.record_success("blockchain_info", (time.perf_counter() - t0) * 1000)
                 for i, tx in enumerate(data.get("txs", [])[:150]):
                     btc_amount = sum(o.get("value", 0) for o in tx.get("out", [])) / 1e8
                     usd_amount = btc_amount * btc_price
@@ -86,20 +124,20 @@ class WhaleMonitorProvider:
 
                     from_addr = tx.get("inputs", [{}])[0].get("prev_out", {}).get("addr", "unknown")
                     to_addr = tx.get("out", [{}])[0].get("addr", "unknown")
-                    txs.append({
-                        "id": f"btc_chain_{tx.get('hash', i)}",
-                        "symbol": "BTC",
-                        "amount": btc_amount,
-                        "amount_usd": usd_amount,
-                        "from_address": from_addr,
-                        "to_address": to_addr,
-                        "from_exchange": self.identify_exchange(from_addr),
-                        "to_exchange": self.identify_exchange(to_addr),
-                        "transaction_type": self.classify_transaction(from_addr, to_addr),
-                        "timestamp": datetime.now(),
-                        "blockchain": "bitcoin"
-                    })
+                    txs.append(self._normalize_event(
+                        chain="bitcoin",
+                        symbol="BTC",
+                        tx_id=f"btc_chain_{tx.get('hash', i)}",
+                        amount=btc_amount,
+                        amount_usd=usd_amount,
+                        from_address=from_addr,
+                        to_address=to_addr,
+                        timestamp=datetime.now(),
+                        source="blockchain_info_mempool",
+                        confidence=0.78
+                    ))
         except Exception as e:
+            observability.record_failure("blockchain_info")
             logger.warning(f"Blockchain mempool fetch failed: {e}")
 
         self._set_cache(cache_key, txs)
@@ -120,6 +158,7 @@ class WhaleMonitorProvider:
         headers = {"User-Agent": "PULSE/1.0"}
 
         try:
+            t0 = time.perf_counter()
             async with httpx.AsyncClient() as client:
                 for exchange, wallets in self.EXCHANGE_WALLETS.items():
                     for address in wallets.get("eth", []):
@@ -148,20 +187,21 @@ class WhaleMonitorProvider:
 
                             from_addr = tx.get("from", "").lower()
                             to_addr = tx.get("to", "").lower()
-                            txs.append({
-                                "id": f"eth_etherscan_{tx.get('hash')}",
-                                "symbol": "ETH",
-                                "amount": eth_amount,
-                                "amount_usd": 0,  # price conversion optional
-                                "from_address": from_addr,
-                                "to_address": to_addr,
-                                "from_exchange": self.identify_exchange(from_addr),
-                                "to_exchange": self.identify_exchange(to_addr),
-                                "transaction_type": self.classify_transaction(from_addr, to_addr),
-                                "timestamp": datetime.fromtimestamp(int(tx.get("timeStamp", "0"))),
-                                "blockchain": "ethereum"
-                            })
+                            txs.append(self._normalize_event(
+                                chain="ethereum",
+                                symbol="ETH",
+                                tx_id=f"eth_etherscan_{tx.get('hash')}",
+                                amount=eth_amount,
+                                amount_usd=0,
+                                from_address=from_addr,
+                                to_address=to_addr,
+                                timestamp=datetime.fromtimestamp(int(tx.get("timeStamp", "0"))),
+                                source="etherscan_txlist",
+                                confidence=0.9
+                            ))
+                observability.record_success("etherscan", (time.perf_counter() - t0) * 1000)
         except Exception as e:
+            observability.record_failure("etherscan")
             logger.warning(f"Etherscan activity fetch failed: {e}")
 
         self._set_cache(cache_key, txs)
@@ -190,19 +230,18 @@ class WhaleMonitorProvider:
                         continue
                     from_addr = row.get("fromAddress", "")
                     to_addr = row.get("toAddress", "")
-                    txs.append({
-                        "id": f"trx_{row.get('transactionHash', '')}",
-                        "symbol": "TRX",
-                        "amount": amount_trx,
-                        "amount_usd": 0,
-                        "from_address": from_addr,
-                        "to_address": to_addr,
-                        "from_exchange": self.identify_exchange(from_addr),
-                        "to_exchange": self.identify_exchange(to_addr),
-                        "transaction_type": self.classify_transaction(from_addr, to_addr),
-                        "timestamp": datetime.fromtimestamp(int(row.get("timestamp", 0)) / 1000) if row.get("timestamp") else datetime.now(),
-                        "blockchain": "tron"
-                    })
+                    txs.append(self._normalize_event(
+                        chain="tron",
+                        symbol="TRX",
+                        tx_id=f"trx_{row.get('transactionHash', '')}",
+                        amount=amount_trx,
+                        amount_usd=0,
+                        from_address=from_addr,
+                        to_address=to_addr,
+                        timestamp=datetime.fromtimestamp(int(row.get("timestamp", 0)) / 1000) if row.get("timestamp") else datetime.now(),
+                        source="tronscan_transfer",
+                        confidence=0.84
+                    ))
         except Exception as e:
             logger.info(f"TRON adapter unavailable: {e}")
 
@@ -210,37 +249,64 @@ class WhaleMonitorProvider:
         return txs
 
     async def _fetch_solana_whales(self) -> List[Dict]:
-        """Free Solana large transfers via Solscan endpoint."""
+        """Solana transfer-grade feed via public RPC."""
         cache_key = "solana_whales"
         cached = self._get_cached(cache_key)
         if cached is not None:
             return cached
 
         txs: List[Dict] = []
+        sol_wallets = [
+            "Vote111111111111111111111111111111111111111",
+        ]
         try:
             async with httpx.AsyncClient() as client:
-                response = await client.get(
-                    "https://public-api.solscan.io/chaininfo",
-                    headers={"accept": "application/json"},
-                    timeout=15.0
-                )
-                response.raise_for_status()
-                # Public endpoint has no transfer list; return adapter heartbeat using chain metadata.
-                chain_info = response.json()
-                txs = [{
-                    "id": "solana_chaininfo_heartbeat",
-                    "symbol": "SOL",
-                    "amount": 0,
-                    "amount_usd": 0,
-                    "from_address": "",
-                    "to_address": "",
-                    "from_exchange": None,
-                    "to_exchange": None,
-                    "transaction_type": "transfer",
-                    "timestamp": datetime.now(),
-                    "blockchain": "solana",
-                    "meta": {"network": chain_info}
-                }]
+                rpc = "https://api.mainnet-beta.solana.com"
+                for wallet in sol_wallets:
+                    sig_resp = await client.post(
+                        rpc,
+                        json={"jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress", "params": [wallet, {"limit": 10}]},
+                        timeout=20.0
+                    )
+                    sig_resp.raise_for_status()
+                    signatures = sig_resp.json().get("result", [])
+                    for sig_item in signatures:
+                        signature = sig_item.get("signature")
+                        if not signature:
+                            continue
+                        tx_resp = await client.post(
+                            rpc,
+                            json={"jsonrpc": "2.0", "id": 1, "method": "getTransaction", "params": [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]},
+                            timeout=20.0
+                        )
+                        tx_resp.raise_for_status()
+                        tx_data = tx_resp.json().get("result")
+                        if not tx_data:
+                            continue
+                        meta = tx_data.get("meta", {})
+                        pre_bal = meta.get("preBalances", [0])
+                        post_bal = meta.get("postBalances", [0])
+                        if not pre_bal or not post_bal:
+                            continue
+                        sol_amount = abs(post_bal[0] - pre_bal[0]) / 1_000_000_000
+                        if sol_amount < 5000:
+                            continue
+                        keys = tx_data.get("transaction", {}).get("message", {}).get("accountKeys", [])
+                        from_addr = keys[0].get("pubkey", wallet) if keys else wallet
+                        to_addr = keys[1].get("pubkey", wallet) if len(keys) > 1 else wallet
+                        block_time = tx_data.get("blockTime")
+                        txs.append(self._normalize_event(
+                            chain="solana",
+                            symbol="SOL",
+                            tx_id=f"sol_{signature}",
+                            amount=sol_amount,
+                            amount_usd=0,
+                            from_address=from_addr,
+                            to_address=to_addr,
+                            timestamp=datetime.fromtimestamp(block_time) if block_time else datetime.now(),
+                            source="solana_rpc_getTransaction",
+                            confidence=0.74
+                        ))
         except Exception as e:
             logger.info(f"Solana adapter unavailable: {e}")
 
@@ -270,19 +336,18 @@ class WhaleMonitorProvider:
                         continue
                     from_addr = row.get("Account", "")
                     to_addr = row.get("Destination", "")
-                    txs.append({
-                        "id": f"xrp_{row.get('hash', '')}",
-                        "symbol": "XRP",
-                        "amount": amount,
-                        "amount_usd": 0,
-                        "from_address": from_addr,
-                        "to_address": to_addr,
-                        "from_exchange": self.identify_exchange(from_addr),
-                        "to_exchange": self.identify_exchange(to_addr),
-                        "transaction_type": self.classify_transaction(from_addr, to_addr),
-                        "timestamp": datetime.now(),
-                        "blockchain": "xrpl"
-                    })
+                    txs.append(self._normalize_event(
+                        chain="xrpl",
+                        symbol="XRP",
+                        tx_id=f"xrp_{row.get('hash', '')}",
+                        amount=amount,
+                        amount_usd=0,
+                        from_address=from_addr,
+                        to_address=to_addr,
+                        timestamp=datetime.now(),
+                        source="xrpscan_transactions",
+                        confidence=0.8
+                    ))
         except Exception as e:
             logger.info(f"XRP adapter unavailable: {e}")
 

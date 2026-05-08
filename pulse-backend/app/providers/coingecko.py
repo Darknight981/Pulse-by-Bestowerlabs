@@ -1,10 +1,13 @@
 """CoinGecko API Provider - Free crypto data"""
 import httpx
 import asyncio
+import time
 from typing import List, Dict, Optional, Any
 from datetime import datetime, timedelta
 import logging
 from ..core.config import settings
+from ..services.observability import observability
+from ..services.resilience import retry_async, circuit_breaker
 
 logger = logging.getLogger(__name__)
 
@@ -74,25 +77,33 @@ class CoinGeckoProvider:
             
         url = f"{self.BASE_URL}/{endpoint}"
         try:
-            async with httpx.AsyncClient() as client:
-                response = await client.get(
-                    url, 
-                    params=params or {}, 
-                    headers=self.headers,
-                    timeout=30.0
-                )
-                
-                if response.status_code == 429:
-                    logger.warning("CoinGecko rate limit hit, waiting...")
-                    await asyncio.sleep(60)
-                    return await self._make_request(endpoint, params)
-                    
-                response.raise_for_status()
-                data = response.json()
-                self._set_cache(cache_key, data)
-                return data
+            if not circuit_breaker.allow("coingecko"):
+                logger.warning("CoinGecko circuit open - request blocked")
+                return None
+
+            t0 = time.perf_counter()
+            async def _request():
+                async with httpx.AsyncClient() as client:
+                    response = await client.get(
+                        url,
+                        params=params or {},
+                        headers=self.headers,
+                        timeout=30.0
+                    )
+                    if response.status_code == 429:
+                        raise httpx.HTTPStatusError("rate_limited", request=response.request, response=response)
+                    response.raise_for_status()
+                    return response.json()
+
+            data = await retry_async(_request, retries=2, delay_seconds=0.5)
+            self._set_cache(cache_key, data)
+            circuit_breaker.mark_success("coingecko")
+            observability.record_success("coingecko", (time.perf_counter() - t0) * 1000)
+            return data
                 
         except Exception as e:
+            circuit_breaker.mark_failure("coingecko")
+            observability.record_failure("coingecko")
             logger.error(f"CoinGecko API error: {e}")
             return None
     

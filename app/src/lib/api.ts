@@ -97,8 +97,10 @@ export const getFlowData = async (symbol: string): Promise<{
 };
 
 // Get trading signal
-export const getSignal = async (symbol: string): Promise<TradeSignal> => {
-  const response = await api.get(`/assets/${symbol}/signal`);
+export const getSignal = async (symbol: string, dataQualityMode: 'off' | 'warn' | 'strict' = 'warn'): Promise<TradeSignal> => {
+  const response = await api.get(`/assets/${symbol}/signal`, {
+    params: { data_quality_mode: dataQualityMode }
+  });
   return response.data;
 };
 
